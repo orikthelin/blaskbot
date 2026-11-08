@@ -40,13 +40,24 @@ def load_scores():
         return {}
 
 
+def write_scores(scores):
+    with open(SCORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(scores, f)
+
+
 def save_score(user_id, name, score):
     scores = load_scores()
     uid = str(user_id)
-    best = max(scores.get(uid, {}).get("score", 0), score)
-    scores[uid] = {"name": name, "score": best}
-    with open(SCORES_FILE, "w", encoding="utf-8") as f:
-        json.dump(scores, f)
+    entry = scores.get(uid)
+    if entry is None:
+        scores[uid] = {"name": name, "score": score, "prev": None}
+    else:
+        entry["name"] = name
+        if score > entry["score"]:
+            # Spara föregående poäng så vi kan visa ökningen
+            entry["prev"] = entry["score"]
+            entry["score"] = score
+    write_scores(scores)
 
 
 def to_jpeg(data):
@@ -99,17 +110,34 @@ def tier_for(score):
     return NAMES[-1]
 
 
+def esc(name):
+    return discord.utils.escape_markdown(name)
+
+
 async def show_leaderboard(message):
     scores = load_scores()
-    top = sorted(scores.values(), key=lambda v: v["score"], reverse=True)[:10]
-    if not top:
+    if not scores:
         await message.reply("Inga poäng inskickade ännu.")
         return
-    lines = [
-        f"{i}. {discord.utils.escape_markdown(v['name'])} — {v['score']:,}"
-        for i, v in enumerate(top, 1)
-    ]
-    await message.reply("**Topp 10 Guild Raid**\n" + "\n".join(lines))
+    entries = list(scores.values())
+
+    top = sorted(entries, key=lambda v: v["score"], reverse=True)[:10]
+    lines = [f"{i}. {esc(v['name'])} — {v['score']:,}"
+             for i, v in enumerate(top, 1)]
+    text = "**Top 10 Guild Raid Scores**\n" + "\n".join(lines)
+
+    improved = [v for v in entries if v.get("prev") is not None]
+    improved.sort(key=lambda v: v["score"] - v["prev"], reverse=True)
+    if improved:
+        lines2 = [
+            f"{i}. {esc(v['name'])}: {v['prev']:,} → {v['score']:,} "
+            f"(+{v['score'] - v['prev']:,})"
+            for i, v in enumerate(improved[:5], 1)
+        ]
+        text += ("\n\n**Largest improvement since last upload**\n"
+                 + "\n".join(lines2))
+
+    await message.reply(text)
 
 
 @client.event
@@ -122,8 +150,18 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    if message.content.strip().lower() == "!leaderboard":
+    cmd = message.content.strip().lower()
+
+    if cmd == "!leaderboard":
         await show_leaderboard(message)
+        return
+
+    if cmd == "!resetscores confirm":
+        if message.author.guild_permissions.administrator:
+            write_scores({})
+            await message.reply("Alla sparade poäng är nollställda.")
+        else:
+            await message.reply("Bara administratörer kan göra det.")
         return
 
     if getattr(message.channel, "name", None) != CHANNEL_NAME:
