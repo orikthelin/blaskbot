@@ -81,8 +81,11 @@ def parse_score(text):
     m = re.search(r"total\s*score", text, re.I)
     if not m:
         return None
-    n = re.search(r"\d{1,3}(?:[,.]\d{3})+", text[m.end():])
-    return int(re.sub(r"\D", "", n.group())) if n else None
+    n = re.search(r"[\dIl|Oo]{1,3}(?:[,.][\dIl|Oo]{3})+", text[m.end():])
+    if not n:
+        return None
+    fixed = n.group().translate(str.maketrans("Il|Oo", "11100"))
+    return int(re.sub(r"\D", "", fixed))
 
 
 def tier_for(score):
@@ -156,7 +159,8 @@ async def on_message(message):
     try:
         role = discord.utils.get(message.guild.roles, name=new)
         if role is None:
-            await message.reply(f"Rollen '{new}' finns inte.")
+            await message.reply(
+                f"Läste {score:,}, men rollen '{new}' finns inte.")
             return
         await member.add_roles(role)
         old = [r for r in member.roles if r.name in NAMES and r.name != new]
