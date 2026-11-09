@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -33,6 +34,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+scanning = False
+
 
 # ---------- storage ----------
 
@@ -66,17 +69,29 @@ def write_scores(scores):
         json.dump(scores, f)
 
 
-def save_score(user_id, name, season, score):
+def fingerprint(data):
+    return hashlib.sha256(data).hexdigest()[:20]
+
+
+def save_score(user_id, name, season, score, digest, ts):
+    """Returns True if saved, False if it was a duplicate."""
     scores = load_scores()
     entry = scores.setdefault(str(user_id), {"name": name, "history": []})
     entry["name"] = name
     h = entry["history"]
-    new = {"season": season, "score": score}
-    # Same season + same score twice in a row counts once
-    if not h or h[-1] != new:
-        h.append(new)
+    # Duplicate = same image file, or same season + same score already saved
+    dup = any(
+        e.get("hash") == digest
+        or (e["season"] == season and e["score"] == score)
+        for e in h
+    )
+    if not dup:
+        h.append({"season": season, "score": score,
+                  "hash": digest, "t": ts})
+        h.sort(key=lambda e: e.get("t", 0))  # keep chronological order
         entry["history"] = h[-KEEP:]
     write_scores(scores)
+    return not dup
 
 
 def current_season(scores):
@@ -143,11 +158,47 @@ def parse_season(text):
     return int(tok)
 
 
+# ---------- roles ----------
+
 def tier_for(score):
     for limit, name in TIERS:
         if score >= limit:
             return name
     return NAMES[-1]
+
+
+async def update_role(member, score):
+    """Roles can only go up. Returns (status, role_name)."""
+    new = tier_for(score)
+    new_i = NAMES.index(new)
+    have = [NAMES.index(r.name) for r in member.roles if r.name in NAMES]
+    # Lower index = higher role
+    if have and min(have) <= new_i:
+        return "kept", NAMES[min(have)]
+    role = discord.utils.get(member.guild.roles, name=new)
+    if role is None:
+        return "missing", new
+    try:
+        await member.add_roles(role)
+        old = [r for r in member.roles if r.name in NAMES and r.name != new]
+        if old:
+            await member.remove_roles(*old)
+    except discord.Forbidden:
+        return "forbidden", new
+    return "added", new
+
+
+async def get_member(guild, user_id, cache):
+    if user_id in cache:
+        return cache[user_id]
+    m = guild.get_member(user_id)
+    if m is None:
+        try:
+            m = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            m = None
+    cache[user_id] = m
+    return m
 
 
 # ---------- commands ----------
@@ -157,14 +208,16 @@ def esc(name):
 
 
 def movers(rows, up):
-    # Top 5 increases (up=True) or decreases (up=False) since last upload
+    # Top 5 percentage increases (up=True) or decreases (up=False)
+    # between a player's last two uploads in the season
     out = []
     for name, h in rows:
-        if len(h) < 2:
+        if len(h) < 2 or h[-2] <= 0:
             continue
-        d = h[-1] - h[-2]
-        if (d > 0) if up else (d < 0):
-            out.append((abs(d), name, h[-2], h[-1]))
+        a, b = h[-2], h[-1]
+        pct = (b - a) / a * 100
+        if (pct > 0) if up else (pct < 0):
+            out.append((abs(pct), name, a, b))
     out.sort(key=lambda r: r[0], reverse=True)
     return out[:5]
 
@@ -175,8 +228,9 @@ def mover_lines(rows, up):
     lines = []
     for i in range(5):
         if i < len(rows):
-            d, name, a, b = rows[i]
-            lines.append(f"{i + 1}. {esc(name)}: {a:,} → {b:,} ({sign}{d:,})")
+            pct, name, a, b = rows[i]
+            lines.append(f"{i + 1}. {esc(name)}: {a:,} → {b:,} "
+                         f"({sign}{pct:.2f}%)")
         else:
             lines.append(f"{i + 1}. {empty}")
     return lines
@@ -282,11 +336,115 @@ async def show_compare(message):
         + "\n".join(lines))
 
 
+async def scan_channel(message):
+    global scanning
+    if scanning:
+        await message.reply("A scan is already running.")
+        return
+    scanning = True
+    try:
+        await message.reply(
+            "Scanning this channel for earlier uploads. "
+            "This can take a while…")
+
+        scores = load_scores()
+        known = {uid: {e.get("hash") for e in v["history"] if e.get("hash")}
+                 for uid, v in scores.items()}
+        stats = {"images": 0, "added": 0, "dupes": 0, "failed": 0, "roles": 0}
+        seen = set()
+        cache = {}
+        fails_in_a_row = 0
+        stopped = False
+
+        try:
+            async with message.channel.typing():
+                async for msg in message.channel.history(
+                        limit=None, oldest_first=True):
+                    if msg.author.bot:
+                        continue
+                    images = [a for a in msg.attachments
+                              if (a.content_type or "").startswith("image/")]
+                    if not images:
+                        continue
+                    stats["images"] += 1
+                    uid = str(msg.author.id)
+                    seen.add(uid)
+
+                    try:
+                        data = await images[0].read()
+                        digest = fingerprint(data)
+                        if digest in known.get(uid, set()):
+                            stats["dupes"] += 1  # already saved, skip OCR
+                            continue
+                        text = await ocr(to_jpeg(data))
+                    except Exception as e:
+                        print("Scan error:", e)
+                        stats["failed"] += 1
+                        fails_in_a_row += 1
+                        if fails_in_a_row >= 5:
+                            stopped = True
+                            break
+                        continue
+                    fails_in_a_row = 0
+
+                    score = parse_score(text)
+                    season = parse_season(text)
+                    if score is None or season is None:
+                        stats["failed"] += 1
+                        continue
+
+                    member = await get_member(message.guild, msg.author.id,
+                                              cache)
+                    name = (member or msg.author).display_name
+                    if save_score(msg.author.id, name, season, score,
+                                  digest, msg.created_at.timestamp()):
+                        stats["added"] += 1
+                    else:
+                        stats["dupes"] += 1
+                    known.setdefault(uid, set()).add(digest)
+        except discord.Forbidden:
+            await message.reply(
+                "I can't read this channel's history. "
+                "I need the 'Read Message History' permission.")
+            return
+
+        # Update roles from each player's highest saved score
+        scores = load_scores()
+        for uid in seen:
+            entry = scores.get(uid)
+            if not entry or not entry["history"]:
+                continue
+            member = await get_member(message.guild, int(uid), cache)
+            if member is None:
+                continue
+            best = max(e["score"] for e in entry["history"])
+            status, _ = await update_role(member, best)
+            if status == "added":
+                stats["roles"] += 1
+
+        summary = (
+            "**Scan finished**\n"
+            f"Screenshots found: {stats['images']}\n"
+            f"New uploads saved: {stats['added']}\n"
+            f"Duplicates skipped: {stats['dupes']}\n"
+            f"Couldn't read: {stats['failed']}\n"
+            f"Roles updated: {stats['roles']}"
+        )
+        if stopped:
+            summary += (
+                "\n\nStopped early after 5 failures in a row (possibly the "
+                "OCR daily limit). Run `!scan` again later; uploads that "
+                "are already saved are skipped.")
+        await message.reply(summary)
+    finally:
+        scanning = False
+
+
 def commands_text(is_owner):
     lines = [
         "**Commands**",
         "`!leaderboard` — top 10, weeks biggest W and weeks biggest "
-        "fumble for the current season",
+        "fumble (% change) for the current season",
         "`!score @player [sNN]` — a player's score in a season "
         "(default: current season), e.g. `!score @blask s98`",
         "`!average @player` — average of a player's last 5 uploads",
@@ -298,6 +456,7 @@ def commands_text(is_owner):
         lines += [
             "",
             "**Owner only**",
+            "`!scan` — scan all earlier uploads in this channel",
             "`!resetscores confirm` — delete all saved scores",
             "Add `debug` as a caption on a screenshot to see the raw OCR text",
         ]
@@ -336,6 +495,12 @@ async def on_message(message):
     if word == "!commands":
         await message.reply(commands_text(is_owner))
         return
+    if word == "!scan":
+        if is_owner:
+            await scan_channel(message)
+        else:
+            await message.reply("Only the bot owner can use that command.")
+        return
     if cmd == "!resetscores confirm":
         if is_owner:
             write_scores({})
@@ -355,6 +520,7 @@ async def on_message(message):
     async with message.channel.typing():
         try:
             data = await images[0].read()
+            digest = fingerprint(data)
             text = await ocr(to_jpeg(data))
             score = parse_score(text)
             season = parse_season(text)
@@ -376,34 +542,22 @@ async def on_message(message):
         return
 
     member = message.author
-    save_score(member.id, member.display_name, season, score)
-
-    new = tier_for(score)
-    new_i = NAMES.index(new)
-    have = [NAMES.index(r.name) for r in member.roles if r.name in NAMES]
+    added = save_score(member.id, member.display_name, season, score,
+                       digest, message.created_at.timestamp())
     read = f"Read {score:,} (season {season})."
+    if not added:
+        read += " Already recorded, so it wasn't counted again."
 
-    # Lower index = higher role. Roles can only go up.
-    if have and min(have) <= new_i:
+    status, role_name = await update_role(member, score)
+    if status == "kept":
         await message.reply(
-            f"{read} You already have {NAMES[min(have)]}, "
-            "so no role change.")
-        return
-
-    try:
-        role = discord.utils.get(message.guild.roles, name=new)
-        if role is None:
-            await message.reply(f"{read} But the role '{new}' doesn't exist.")
-            return
-        await member.add_roles(role)
-        old = [r for r in member.roles if r.name in NAMES and r.name != new]
-        if old:
-            await member.remove_roles(*old)
-    except discord.Forbidden:
+            f"{read} You already have {role_name}, so no role change.")
+    elif status == "missing":
+        await message.reply(f"{read} But the role '{role_name}' doesn't exist.")
+    elif status == "forbidden":
         await message.reply("I don't have permission to change roles.")
-        return
-
-    await message.reply(f"{read} New role: {new}")
+    else:
+        await message.reply(f"{read} New role: {role_name}")
 
 
 client.run(TOKEN)
