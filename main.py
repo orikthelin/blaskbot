@@ -15,6 +15,10 @@ SCORES_FILE = "scores.json"
 OWNER_ID = 890863615316459540  # only this user can use management commands
 KEEP = 200  # uploads kept per player
 
+# Leaderboard display tweaks (Discord user IDs)
+NAME_OVERRIDES = {434338272836190208: "Uranus"}
+TOO_LOW = {434338272836190208}
+
 # (minimum score, role name), highest first
 TIERS = [
     (4_000_000_000, "Solar"),
@@ -188,6 +192,26 @@ async def update_role(member, score):
     return "added", new
 
 
+async def force_role(member, score):
+    """Set the tier role to exactly match score, even if that means going
+    down. score=None removes all tier roles. Returns (status, role_name)."""
+    target = tier_for(score) if score is not None else None
+    try:
+        old = [r for r in member.roles
+               if r.name in NAMES and r.name != target]
+        if old:
+            await member.remove_roles(*old)
+        if target:
+            role = discord.utils.get(member.guild.roles, name=target)
+            if role is None:
+                return "missing", target
+            if role not in member.roles:
+                await member.add_roles(role)
+    except discord.Forbidden:
+        return "forbidden", target
+    return "ok", target
+
+
 async def get_member(guild, user_id, cache):
     if user_id in cache:
         return cache[user_id]
@@ -211,7 +235,7 @@ def movers(rows, up):
     # Top 5 percentage increases (up=True) or decreases (up=False)
     # between a player's last two uploads in the season
     out = []
-    for name, h in rows:
+    for name, h, _ in rows:
         if len(h) < 2 or h[-2] <= 0:
             continue
         a, b = h[-2], h[-1]
@@ -243,15 +267,18 @@ async def show_leaderboard(message):
         await message.reply("No scores have been submitted yet.")
         return
 
-    rows = []
-    for v in scores.values():
+    rows = []  # (display name, scores this season, user id)
+    for uid, v in scores.items():
         h = season_scores(v, season)
         if h:
-            rows.append((v["name"], h))
+            name = NAME_OVERRIDES.get(int(uid), v["name"])
+            rows.append((name, h, int(uid)))
 
     top = sorted(rows, key=lambda r: r[1][-1], reverse=True)[:10]
-    lines = [f"{i}. {esc(n)} — {h[-1]:,}"
-             for i, (n, h) in enumerate(top, 1)]
+    lines = []
+    for i, (n, h, uid) in enumerate(top, 1):
+        tag = " *(too low)*" if uid in TOO_LOW else ""
+        lines.append(f"{i}. {esc(n)} — {h[-1]:,}{tag}")
     text = f"**Top 10 – Guild Raid Season {season}**\n" + "\n".join(lines)
 
     text += "\n\n**weeks biggest W**\n"
@@ -334,6 +361,59 @@ async def show_compare(message):
     await message.reply(
         f"**{name} — last {len(lines)} uploads** (newest first)\n"
         + "\n".join(lines))
+
+
+async def delete_season(message, parts):
+    season = None
+    for p in parts[1:]:
+        m = re.fullmatch(r"s?(\d{1,3})", p)
+        if m:
+            season = int(m.group(1))
+    if season is None or not message.mentions:
+        await message.reply(
+            "Usage: `!delete sNN @player`, e.g. `!delete s98 @blask`")
+        return
+
+    target = message.mentions[0]
+    name = esc(target.display_name)
+    uid = str(target.id)
+    scores = load_scores()
+    entry = scores.get(uid)
+    if not entry:
+        await message.reply(f"{name} has no uploads from season {season}.")
+        return
+
+    before = len(entry["history"])
+    entry["history"] = [e for e in entry["history"]
+                        if e["season"] != season]
+    removed = before - len(entry["history"])
+    if removed == 0:
+        await message.reply(f"{name} has no uploads from season {season}.")
+        return
+
+    # Highest score left across all seasons (None if nothing remains)
+    best = max((e["score"] for e in entry["history"]), default=None)
+    if not entry["history"]:
+        del scores[uid]  # nothing left for this player
+    write_scores(scores)
+
+    s = "" if removed == 1 else "s"
+    reply = f"Deleted {removed} upload{s} from season {season} for {name}."
+
+    member = await get_member(message.guild, target.id, {})
+    if member is None:
+        reply += " Couldn't update their role: member not found."
+    else:
+        status, role_name = await force_role(member, best)
+        if status == "ok" and role_name:
+            reply += f" Their role is now {role_name}."
+        elif status == "ok":
+            reply += " No uploads left, so their tier role was removed."
+        elif status == "missing":
+            reply += f" But the role '{role_name}' doesn't exist."
+        else:
+            reply += " I don't have permission to change their roles."
+    await message.reply(reply)
 
 
 async def scan_channel(message):
@@ -457,6 +537,8 @@ def commands_text(is_owner):
             "",
             "**Owner only**",
             "`!scan` — scan all earlier uploads in this channel",
+            "`!delete sNN @player` — delete a player's uploads from a "
+            "season and lower their role to match what's left",
             "`!resetscores confirm` — delete all saved scores",
             "Add `debug` as a caption on a screenshot to see the raw OCR text",
         ]
@@ -498,6 +580,12 @@ async def on_message(message):
     if word == "!scan":
         if is_owner:
             await scan_channel(message)
+        else:
+            await message.reply("Only the bot owner can use that command.")
+        return
+    if word == "!delete":
+        if is_owner:
+            await delete_season(message, parts)
         else:
             await message.reply("Only the bot owner can use that command.")
         return
