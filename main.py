@@ -579,3 +579,81 @@ async def on_message(message):
     if word == "!average":
         await show_average(message)
         return
+    if word == "!compare":
+        await show_compare(message)
+        return
+    if word == "!commands":
+        await message.reply(commands_text(is_owner))
+        return
+    if word == "!scan":
+        if is_owner:
+            await scan_channel(message)
+        else:
+            await message.reply("Only the bot owner can use that command.")
+        return
+    if word == "!delete":
+        if is_owner:
+            await delete_season(message, parts)
+        else:
+            await message.reply("Only the bot owner can use that command.")
+        return
+    if cmd == "!resetscores confirm":
+        if is_owner:
+            write_scores({})
+            await message.reply("All saved scores have been deleted.")
+        else:
+            await message.reply("Only the bot owner can use that command.")
+        return
+
+    # Score submissions
+    if getattr(message.channel, "name", None) != CHANNEL_NAME:
+        return
+    images = [a for a in message.attachments
+              if (a.content_type or "").startswith("image/")]
+    if not images:
+        return
+
+    async with message.channel.typing():
+        try:
+            data = await images[0].read()
+            digest = fingerprint(data)
+            text = await ocr(to_jpeg(data))
+            score = parse_score(text)
+            season = parse_season(text)
+        except Exception as e:
+            print("OCR error:", e)
+            await message.reply("Couldn't read the image, please try again.")
+            return
+
+    if is_owner and "debug" in message.content.lower():
+        await message.reply(f"```\n{text[:600]}\n```")
+
+    if score is None:
+        await message.reply("Couldn't find 'My Total Score' in the image.")
+        return
+    if season is None:
+        await message.reply(
+            "Couldn't find the season number in the image. "
+            "Please upload the full Guild Raid screen.")
+        return
+
+    member = message.author
+    added = save_score(member.id, member.display_name, season, score,
+                       digest, message.created_at.timestamp())
+    read = f"Read {score:,} (season {season})."
+    if not added:
+        read += " Already recorded, so it wasn't counted again."
+
+    status, role_name = await update_role(member, score)
+    if status == "kept":
+        await message.reply(
+            f"{read} You already have {role_name}, so no role change.")
+    elif status == "missing":
+        await message.reply(f"{read} But the role '{role_name}' doesn't exist.")
+    elif status == "forbidden":
+        await message.reply("I don't have permission to change roles.")
+    else:
+        await message.reply(f"{read} New role: {role_name}")
+
+
+client.run(TOKEN)
