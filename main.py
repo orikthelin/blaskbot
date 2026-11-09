@@ -239,4 +239,343 @@ def movers(pairs, up):
         if a <= 0:
             continue
         pct = (b - a) / a * 100
-        if (pct > 0) if up else (pct 
+        if up and pct > 0:
+            out.append((pct, name, a, b))
+        elif not up and pct < 0:
+            out.append((-pct, name, a, b))
+    out.sort(key=lambda r: r[0], reverse=True)
+    return out[:5]
+
+
+def mover_lines(rows, up):
+    sign = "+" if up else "-"
+    empty = "no more increases" if up else "no more decreases"
+    lines = []
+    for i in range(5):
+        if i < len(rows):
+            pct, name, a, b = rows[i]
+            lines.append(f"{i + 1}. {esc(name)}: {a:,} → {b:,} "
+                         f"({sign}{pct:.2f}%)")
+        else:
+            lines.append(f"{i + 1}. {empty}")
+    return lines
+
+
+async def show_leaderboard(message):
+    scores = load_scores()
+    season = current_season(scores)
+    if season is None:
+        await message.reply("No scores have been submitted yet.")
+        return
+    prev_season = season - 1
+
+    rows = []   # (display name, scores this season, user id)
+    pairs = []  # (display name, previous season score, current season score)
+    for uid, v in scores.items():
+        cur = season_scores(v, season)
+        if not cur:
+            continue
+        name = NAME_OVERRIDES.get(int(uid), v["name"])
+        rows.append((name, cur, int(uid)))
+        prev = season_scores(v, prev_season)
+        if prev:
+            pairs.append((name, prev[-1], cur[-1]))
+
+    top = sorted(rows, key=lambda r: r[1][-1], reverse=True)[:10]
+    lines = []
+    for i, (n, h, uid) in enumerate(top, 1):
+        tag = " *(too low)*" if uid in TOO_LOW else ""
+        lines.append(f"{i}. {esc(n)} — {h[-1]:,}{tag}")
+    text = f"**Top 10 – Guild Raid Season {season}**\n" + "\n".join(lines)
+
+    span = f"(S{prev_season} → S{season})"
+    text += f"\n\n**weeks biggest W** {span}\n"
+    text += "\n".join(mover_lines(movers(pairs, True), True))
+    text += f"\n\n**weeks biggest fumble** {span}\n"
+    text += "\n".join(mover_lines(movers(pairs, False), False))
+
+    await message.reply(text)
+
+
+async def show_score(message, parts):
+    if not message.mentions:
+        await message.reply("Usage: `!score @player [sNN]`, e.g. "
+                            "`!score @blask s98`")
+        return
+    target = message.mentions[0]
+    name = esc(target.display_name)
+    scores = load_scores()
+
+    season = None
+    for p in parts[1:]:
+        m = re.fullmatch(r"s?(\d{1,3})", p)
+        if m:
+            season = int(m.group(1))
+    if season is None:
+        season = current_season(scores)
+    if season is None:
+        await message.reply("No scores have been submitted yet.")
+        return
+
+    entry = scores.get(str(target.id))
+    h = season_scores(entry, season) if entry else []
+    if not h:
+        await message.reply(
+            f"{name} hasn't uploaded any score from season {season}.")
+        return
+    extra = f" (latest of {len(h)} uploads)" if len(h) > 1 else ""
+    await message.reply(f"**{name}** — season {season}: {h[-1]:,}{extra}")
+
+
+async def show_average(message):
+    if not message.mentions:
+        await message.reply("Usage: `!average @player`")
+        return
+    target = message.mentions[0]
+    name = esc(target.display_name)
+    entry = load_scores().get(str(target.id))
+    if not entry or not entry["history"]:
+        await message.reply(f"{name} hasn't uploaded any scores yet.")
+        return
+    last = [e["score"] for e in entry["history"][-5:]]
+    avg = round(sum(last) / len(last))
+    s = "" if len(last) == 1 else "s"
+    await message.reply(
+        f"**{name}**: average of last {len(last)} upload{s}: {avg:,}")
+
+
+async def show_compare(message):
+    if not message.mentions:
+        await message.reply("Usage: `!compare @player`")
+        return
+    target = message.mentions[0]
+    name = esc(target.display_name)
+    entry = load_scores().get(str(target.id))
+    if not entry or not entry["history"]:
+        await message.reply(f"{name} hasn't uploaded any scores yet.")
+        return
+
+    h = entry["history"]
+    lines = []
+    for n, i in enumerate(range(len(h) - 1, max(len(h) - 6, -1), -1), 1):
+        e = h[i]
+        label = f"S{e['season']}" if e["season"] is not None else "S?"
+        line = f"{n}. {label}: {e['score']:,}"
+        # Show the change if the previous upload was from the same season
+        if i > 0 and h[i - 1]["season"] == e["season"]:
+            d = e["score"] - h[i - 1]["score"]
+            line += f" ({'+' if d >= 0 else '-'}{abs(d):,})"
+        lines.append(line)
+    await message.reply(
+        f"**{name} — last {len(lines)} uploads** (newest first)\n"
+        + "\n".join(lines))
+
+
+async def delete_season(message, parts):
+    season = None
+    for p in parts[1:]:
+        m = re.fullmatch(r"s?(\d{1,3})", p)
+        if m:
+            season = int(m.group(1))
+    if season is None or not message.mentions:
+        await message.reply(
+            "Usage: `!delete sNN @player`, e.g. `!delete s98 @blask`")
+        return
+
+    target = message.mentions[0]
+    name = esc(target.display_name)
+    uid = str(target.id)
+    scores = load_scores()
+    entry = scores.get(uid)
+    if not entry:
+        await message.reply(f"{name} has no uploads from season {season}.")
+        return
+
+    before = len(entry["history"])
+    entry["history"] = [e for e in entry["history"]
+                        if e["season"] != season]
+    removed = before - len(entry["history"])
+    if removed == 0:
+        await message.reply(f"{name} has no uploads from season {season}.")
+        return
+
+    # Highest score left across all seasons (None if nothing remains)
+    best = max((e["score"] for e in entry["history"]), default=None)
+    if not entry["history"]:
+        del scores[uid]  # nothing left for this player
+    write_scores(scores)
+
+    s = "" if removed == 1 else "s"
+    reply = f"Deleted {removed} upload{s} from season {season} for {name}."
+
+    member = await get_member(message.guild, target.id, {})
+    if member is None:
+        reply += " Couldn't update their role: member not found."
+    else:
+        status, role_name = await force_role(member, best)
+        if status == "ok" and role_name:
+            reply += f" Their role is now {role_name}."
+        elif status == "ok":
+            reply += " No uploads left, so their tier role was removed."
+        elif status == "missing":
+            reply += f" But the role '{role_name}' doesn't exist."
+        else:
+            reply += " I don't have permission to change their roles."
+    await message.reply(reply)
+
+
+async def scan_channel(message):
+    global scanning
+    if scanning:
+        await message.reply("A scan is already running.")
+        return
+    scanning = True
+    try:
+        await message.reply(
+            "Scanning this channel for earlier uploads. "
+            "This can take a while…")
+
+        scores = load_scores()
+        known = {uid: {e.get("hash") for e in v["history"] if e.get("hash")}
+                 for uid, v in scores.items()}
+        stats = {"images": 0, "added": 0, "dupes": 0, "failed": 0, "roles": 0}
+        seen = set()
+        cache = {}
+        fails_in_a_row = 0
+        stopped = False
+
+        try:
+            async with message.channel.typing():
+                async for msg in message.channel.history(
+                        limit=None, oldest_first=True):
+                    if msg.author.bot:
+                        continue
+                    images = [a for a in msg.attachments
+                              if (a.content_type or "").startswith("image/")]
+                    if not images:
+                        continue
+                    stats["images"] += 1
+                    uid = str(msg.author.id)
+                    seen.add(uid)
+
+                    try:
+                        data = await images[0].read()
+                        digest = fingerprint(data)
+                        if digest in known.get(uid, set()):
+                            stats["dupes"] += 1  # already saved, skip OCR
+                            continue
+                        text = await ocr(to_jpeg(data))
+                    except Exception as e:
+                        print("Scan error:", e)
+                        stats["failed"] += 1
+                        fails_in_a_row += 1
+                        if fails_in_a_row >= 5:
+                            stopped = True
+                            break
+                        continue
+                    fails_in_a_row = 0
+
+                    score = parse_score(text)
+                    season = parse_season(text)
+                    if score is None or season is None:
+                        stats["failed"] += 1
+                        continue
+
+                    member = await get_member(message.guild, msg.author.id,
+                                              cache)
+                    name = (member or msg.author).display_name
+                    if save_score(msg.author.id, name, season, score,
+                                  digest, msg.created_at.timestamp()):
+                        stats["added"] += 1
+                    else:
+                        stats["dupes"] += 1
+                    known.setdefault(uid, set()).add(digest)
+        except discord.Forbidden:
+            await message.reply(
+                "I can't read this channel's history. "
+                "I need the 'Read Message History' permission.")
+            return
+
+        # Update roles from each player's highest saved score
+        scores = load_scores()
+        for uid in seen:
+            entry = scores.get(uid)
+            if not entry or not entry["history"]:
+                continue
+            member = await get_member(message.guild, int(uid), cache)
+            if member is None:
+                continue
+            best = max(e["score"] for e in entry["history"])
+            status, _ = await update_role(member, best)
+            if status == "added":
+                stats["roles"] += 1
+
+        summary = (
+            "**Scan finished**\n"
+            f"Screenshots found: {stats['images']}\n"
+            f"New uploads saved: {stats['added']}\n"
+            f"Duplicates skipped: {stats['dupes']}\n"
+            f"Couldn't read: {stats['failed']}\n"
+            f"Roles updated: {stats['roles']}"
+        )
+        if stopped:
+            summary += (
+                "\n\nStopped early after 5 failures in a row (possibly the "
+                "OCR daily limit). Run `!scan` again later; uploads that "
+                "are already saved are skipped.")
+        await message.reply(summary)
+    finally:
+        scanning = False
+
+
+def commands_text(is_owner):
+    lines = [
+        "**Commands**",
+        "`!leaderboard` — top 10 for the current season, plus weeks biggest "
+        "W and weeks biggest fumble (% change vs the previous season)",
+        "`!score @player [sNN]` — a player's score in a season "
+        "(default: current season), e.g. `!score @blask s98`",
+        "`!average @player` — average of a player's last 5 uploads",
+        "`!compare @player` — a player's last 5 uploaded scores",
+        "`!commands` — show this list",
+        f"Post a screenshot in #{CHANNEL_NAME} to submit your score.",
+    ]
+    if is_owner:
+        lines += [
+            "",
+            "**Owner only**",
+            "`!scan` — scan all earlier uploads in this channel",
+            "`!delete sNN @player` — delete a player's uploads from a "
+            "season and lower their role to match what's left",
+            "`!resetscores confirm` — delete all saved scores",
+            "Add `debug` as a caption on a screenshot to see the raw OCR text",
+        ]
+    return "\n".join(lines)
+
+
+# ---------- events ----------
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+
+
+@client.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return
+
+    cmd = message.content.strip().lower()
+    parts = cmd.split()
+    word = parts[0] if parts else ""
+    is_owner = message.author.id == OWNER_ID
+
+    if word == "!leaderboard":
+        await show_leaderboard(message)
+        return
+    if word == "!score":
+        await show_score(message, parts)
+        return
+    if word == "!average":
+        await show_average(message)
+        return
