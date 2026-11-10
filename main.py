@@ -15,6 +15,10 @@ SCORES_FILE = "scores.json"
 OWNER_ID = 890863615316459540  # only this user can use management commands
 KEEP = 200  # uploads kept per player
 
+# Anti-fake checks
+ANCHORS = ("match history", "entry count", "guild ranking", "reward info")
+MAX_SEASON_JUMP = 5  # a new season can be at most this far above the current
+
 # Leaderboard display tweaks (Discord user IDs)
 NAME_OVERRIDES = {434338272836190208: "Uranus"}
 TOO_LOW = {434338272836190208}
@@ -138,18 +142,33 @@ async def ocr(jpeg):
     return "\n".join(p["ParsedText"] for p in j["ParsedResults"])
 
 
-def parse_score(text):
-    # First number after "Total Score". OCR often mangles commas and dots,
-    # so only the digits are used.
+def parse_numbers(text):
+    # Numbers printed after "Total Score", in reading order. OCR often
+    # mangles commas and dots, so only the digits are used.
     m = re.search(r"total\s*score", text, re.I)
     if not m:
-        return None
+        return []
     pattern = r"(?<![A-Za-z])[\dIl|Oo][\dIl|Oo,.]*"
+    nums = []
     for tok in re.findall(pattern, text[m.end():]):
         if not any(c.isdigit() for c in tok):
             continue
         tok = tok.translate(str.maketrans("Il|Oo", "11100"))
-        return int(re.sub(r"\D", "", tok))
+        nums.append(int(re.sub(r"\D", "", tok)))
+    return nums
+
+
+def parse_score(text):
+    # "My Total Score" = first number after the label
+    nums = parse_numbers(text)
+    return nums[0] if nums else None
+
+
+def parse_guild_score(text):
+    # "Total Guild Score" = the next big number after that
+    for n in parse_numbers(text)[1:]:
+        if n >= 100_000:
+            return n
     return None
 
 
@@ -160,6 +179,40 @@ def parse_season(text):
         return None
     tok = m.group(1).translate(str.maketrans("Il|Oo", "11100"))
     return int(tok)
+
+
+# ---------- anti-fake checks ----------
+
+def verify(text, score, season, scores):
+    """Returns None if the screenshot looks genuine, else the reason."""
+    low = text.lower()
+    if "guild score" not in low or sum(a in low for a in ANCHORS) < 2:
+        return "it doesn't look like the full Guild Raid screen"
+    guild = parse_guild_score(text)
+    if guild is None:
+        return "I couldn't read the Total Guild Score"
+    if score > guild:
+        return ("My Total Score is higher than the Total Guild Score, "
+                "which isn't possible")
+    cur = current_season(scores)
+    if cur is not None and season > cur + MAX_SEASON_JUMP:
+        return (f"season {season} is too far ahead of the "
+                f"current season ({cur})")
+    return None
+
+
+def taken_by_other(scores, uid, digest, season, score):
+    """Reason string if ANOTHER player already submitted this image or this
+    exact score for this season, else None."""
+    for other, v in scores.items():
+        if other == uid:
+            continue
+        for e in v["history"]:
+            if (e.get("hash") == digest
+                    or (e["season"] == season and e["score"] == score)):
+                return ("that screenshot or score was already submitted "
+                        "by another player")
+    return None
 
 
 # ---------- roles ----------
@@ -261,16 +314,24 @@ def mover_lines(rows, up):
     return lines
 
 
-async def show_leaderboard(message):
+async def show_leaderboard(message, parts):
     scores = load_scores()
-    season = current_season(scores)
+
+    # Optional season: !leaderboard s97 (or just 97). Default: current.
+    season = None
+    for p in parts[1:]:
+        m = re.fullmatch(r"s?(\d{1,3})", p)
+        if m:
+            season = int(m.group(1))
+    if season is None:
+        season = current_season(scores)
     if season is None:
         await message.reply("No scores have been submitted yet.")
         return
     prev_season = season - 1
 
     rows = []   # (display name, scores this season, user id)
-    pairs = []  # (display name, previous season score, current season score)
+    pairs = []  # (display name, previous season score, this season score)
     for uid, v in scores.items():
         cur = season_scores(v, season)
         if not cur:
@@ -281,10 +342,15 @@ async def show_leaderboard(message):
         if prev:
             pairs.append((name, prev[-1], cur[-1]))
 
+    if not rows:
+        await message.reply(
+            f"No scores have been submitted for season {season}.")
+        return
+
     top = sorted(rows, key=lambda r: r[1][-1], reverse=True)[:10]
     lines = []
     for i, (n, h, uid) in enumerate(top, 1):
-        tag = " *(too low)*" if uid in TOO_LOW else ""
+        tag = " *(soo low)*" if uid in TOO_LOW else ""
         lines.append(f"{i}. {esc(n)} — {h[-1]:,}{tag}")
     text = f"**Top 10 – Guild Raid Season {season}**\n" + "\n".join(lines)
 
@@ -438,7 +504,8 @@ async def scan_channel(message):
         scores = load_scores()
         known = {uid: {e.get("hash") for e in v["history"] if e.get("hash")}
                  for uid, v in scores.items()}
-        stats = {"images": 0, "added": 0, "dupes": 0, "failed": 0, "roles": 0}
+        stats = {"images": 0, "added": 0, "dupes": 0, "failed": 0,
+                 "rejected": 0, "roles": 0}
         seen = set()
         cache = {}
         fails_in_a_row = 0
@@ -481,6 +548,14 @@ async def scan_channel(message):
                         stats["failed"] += 1
                         continue
 
+                    now = load_scores()
+                    reason = (verify(text, score, season, now)
+                              or taken_by_other(now, uid, digest,
+                                                season, score))
+                    if reason:
+                        stats["rejected"] += 1
+                        continue
+
                     member = await get_member(message.guild, msg.author.id,
                                               cache)
                     name = (member or msg.author).display_name
@@ -515,6 +590,7 @@ async def scan_channel(message):
             f"Screenshots found: {stats['images']}\n"
             f"New uploads saved: {stats['added']}\n"
             f"Duplicates skipped: {stats['dupes']}\n"
+            f"Rejected as invalid: {stats['rejected']}\n"
             f"Couldn't read: {stats['failed']}\n"
             f"Roles updated: {stats['roles']}"
         )
@@ -531,8 +607,9 @@ async def scan_channel(message):
 def commands_text(is_owner):
     lines = [
         "**Commands**",
-        "`!leaderboard` — top 10 for the current season, plus weeks biggest "
-        "W and weeks biggest fumble (% change vs the previous season)",
+        "`!leaderboard [sNN]` — top 10 for a season (default: current), "
+        "plus weeks biggest W and weeks biggest fumble (% change vs the "
+        "season before), e.g. `!leaderboard s97`",
         "`!score @player [sNN]` — a player's score in a season "
         "(default: current season), e.g. `!score @blask s98`",
         "`!average @player` — average of a player's last 5 uploads",
@@ -571,7 +648,7 @@ async def on_message(message):
     is_owner = message.author.id == OWNER_ID
 
     if word == "!leaderboard":
-        await show_leaderboard(message)
+        await show_leaderboard(message, parts)
         return
     if word == "!score":
         await show_score(message, parts)
@@ -635,6 +712,16 @@ async def on_message(message):
         await message.reply(
             "Couldn't find the season number in the image. "
             "Please upload the full Guild Raid screen.")
+        return
+
+    existing = load_scores()
+    reason = (verify(text, score, season, existing)
+              or taken_by_other(existing, str(message.author.id), digest,
+                                season, score))
+    if reason:
+        await message.reply(
+            f"Upload rejected: {reason}. If this is a genuine screenshot, "
+            "please upload the full, unedited Guild Raid screen.")
         return
 
     member = message.author
