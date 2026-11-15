@@ -22,7 +22,7 @@ JUMP_DOWN = 0.5
 
 # Cosmos members: (IGN, Discord ID). New members: use !link <id> IGN
 COSMOS_ROSTER = [
-    ("PBIRD", 1170638503055474819),
+    ("TPBIRD", 1170638503055474819),
     ("HASSEN", 1549509748741636207),
     ("ᶜᵒˢSabo", 333119924056621059),
     ("Al3in", 680539772615131187),
@@ -57,6 +57,8 @@ COSMOS_ROSTER = [
     ("Dslayersss", 546472642987687956),
     ("ᶜᵒˢCrazy", 236847113588310016),
     ("ᴺᵒᵗProofy", 137822664508047360),
+    ("Aaronツ", 411629173535145984),
+    ("송우기x초나", 1165275510457258034),
 ]
 
 # Astryx members: (IGN, Discord ID). Empty for now: add members with
@@ -190,13 +192,19 @@ def best_overall(uid):
 
 
 def parse_entry(line):
-    """'Blask 5007263' -> ('Blask', 5007263), or None if it doesn't parse."""
+    """'Blask 5007263' or 'Blask 5 007 263' -> ('Blask', 5007263),
+    or None if the line doesn't parse."""
     line = line.strip()
     line = re.sub(r"^(?:[-*•]\s+|\d{1,3}[.)]\s+)", "", line)  # bullets, "1. "
-    m = re.fullmatch(r"(.+?)\s*[:=\-–—]?\s+(\d[\d,._]*)", line)
+    # The score is the number at the end of the line. Groups of three digits
+    # may be separated by spaces, commas or dots (5 076 065 067).
+    m = re.search(r"(?<!\S)(\d{1,3}(?:[\s,._']\d{3})+|\d+)\s*$", line)
     if not m:
         return None
-    return m.group(1).strip(), int(re.sub(r"\D", "", m.group(2)))
+    ign = re.sub(r"[\s:=\-–—]+$", "", line[:m.start()])
+    if not ign:
+        return None
+    return ign, int(re.sub(r"\D", "", m.group(1)))
 
 
 def split_args(content):
