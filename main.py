@@ -7,7 +7,6 @@ import unicodedata
 import discord
 
 TOKEN = os.environ["DISCORD_TOKEN"]
-DATA_FILE = "members.json"
 
 # Discord user IDs allowed to use the management commands
 OWNER_IDS = {890863615316459540}
@@ -16,8 +15,13 @@ OWNER_IDS = {890863615316459540}
 NAME_OVERRIDES = {434338272836190208: "Uranus"}
 TOO_LOW = {434338272836190208}
 
-# Member roster: (IGN, Discord ID). New members: use !link <id> IGN
-ROSTER = [
+# !list flags a score as unusual if it's more than JUMP_UP times, or less
+# than JUMP_DOWN times, the player's score in the previous season
+JUMP_UP = 2.0
+JUMP_DOWN = 0.5
+
+# Cosmos members: (IGN, Discord ID). New members: use !link <id> IGN
+COSMOS_ROSTER = [
     ("PBIRD", 1170638503055474819),
     ("HASSEN", 1549509748741636207),
     ("ᶜᵒˢSabo", 333119924056621059),
@@ -55,7 +59,12 @@ ROSTER = [
     ("ᴺᵒᵗProofy", 137822664508047360),
 ]
 
-# (minimum score, role name), highest first
+# Astryx members: (IGN, Discord ID). Empty for now: add members with
+# !astlink <id> IGN, or paste them here like the Cosmos list above.
+ASTRYX_ROSTER = []
+
+# (minimum score, role name), highest first. The tier roles are shared by
+# both guilds.
 TIERS = [
     (4_000_000_000, "Solar"),
     (3_500_000_000, "Nebula"),
@@ -77,6 +86,41 @@ intents.message_content = True
 # The bot never pings anyone, even if a name contains @everyone
 client = discord.Client(
     intents=intents, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ---------- guilds ----------
+# Each guild has its own data file, member list and commands.
+# members.json: { "<discord id>": {"ign": "ᶜᵒˢBlask", "active": true,
+#                                  "scores": {"100": 5007263, ...}} }
+
+class GuildData:
+    def __init__(self, name, tag, prefix, file, roster):
+        self.name = name      # shown in messages
+        self.tag = tag        # "" for Cosmos, "Astryx" in Astryx titles
+        self.prefix = prefix  # command prefix: "!" or "!ast"
+        self.file = file
+        self.roster = roster
+
+    def load(self):
+        try:
+            with open(self.file, encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, ValueError):
+            data = {}
+        for ign, uid in self.roster:  # members missing from the file
+            data.setdefault(str(uid),
+                            {"ign": ign, "active": True, "scores": {}})
+        return data
+
+    def save(self, data):
+        with open(self.file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+
+COSMOS = GuildData("Cosmos", "", "!", "members.json", COSMOS_ROSTER)
+ASTRYX = GuildData("Astryx", "Astryx", "!ast", "astryx_members.json",
+                   ASTRYX_ROSTER)
+GUILDS = (COSMOS, ASTRYX)
 
 
 # ---------- names ----------
@@ -101,26 +145,7 @@ def match_key(name):
     return " ".join(s.split()).casefold()
 
 
-# ---------- storage ----------
-# members.json: { "<discord id>": {"ign": "ᶜᵒˢBlask", "active": true,
-#                                  "scores": {"100": 5007263, ...}} }
-
-def load_data():
-    try:
-        with open(DATA_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, ValueError):
-        data = {}
-    for ign, uid in ROSTER:  # members missing from the file are added
-        data.setdefault(str(uid),
-                        {"ign": ign, "active": True, "scores": {}})
-    return data
-
-
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-
+# ---------- data helpers ----------
 
 def name_index(data, include_inactive=False):
     """match_key -> discord id."""
@@ -133,6 +158,16 @@ def current_season(data):
     return max(seasons) if seasons else None
 
 
+def season_from_args(content, data):
+    """Optional season in '!command s97' (or '97'); default: current."""
+    season = None
+    for w in content.split()[1:]:
+        m = re.fullmatch(r"s?(\d{1,3})", w, re.I)
+        if m:
+            season = int(m.group(1))
+    return season if season is not None else current_season(data)
+
+
 def sorted_scores(p):
     """[(season, score), ...] oldest first."""
     return sorted((int(s), v) for s, v in p["scores"].items())
@@ -140,6 +175,18 @@ def sorted_scores(p):
 
 def best_score(p):
     return max(p["scores"].values(), default=None)
+
+
+def best_overall(uid):
+    """Highest score of this Discord user across both guilds."""
+    vals = []
+    for g in GUILDS:
+        p = g.load().get(uid)
+        if p:
+            b = best_score(p)
+            if b is not None:
+                vals.append(b)
+    return max(vals, default=None)
 
 
 def parse_entry(line):
@@ -164,15 +211,15 @@ def split_args(content):
     return season, " ".join(rest)
 
 
-def find_player(data, message, text):
-    """Look up a player by @mention, Discord ID or IGN.
+def find_player(g, data, message, text):
+    """Look up a player by @mention, Discord ID or IGN in one guild.
     Returns (discord id, player, error)."""
     if message.mentions:
         uid = str(message.mentions[0].id)
         if uid in data:
             return uid, data[uid], None
-        return None, None, ("That Discord user isn't in the roster. "
-                            "Use `!link <discord id> IGN`.")
+        return None, None, (f"That Discord user isn't in the {g.name} "
+                            f"roster. Use `{g.prefix}link <discord id> IGN`.")
     if not text:
         return None, None, "Please give a player's IGN (or an @mention)."
     if re.fullmatch(r"\d{15,20}", text) and text in data:
@@ -183,7 +230,21 @@ def find_player(data, message, text):
     return uid, data[uid], None
 
 
-# ---------- roles ----------
+def lookup_any(message, text):
+    """Search Cosmos first, then Astryx.
+    Returns (guild, data, discord id, player, error)."""
+    first_err = None
+    for g in GUILDS:
+        data = g.load()
+        uid, p, err = find_player(g, data, message, text)
+        if p is not None:
+            return g, data, uid, p, None
+        if first_err is None:
+            first_err = err
+    return None, None, None, None, first_err
+
+
+# ---------- roles (shared by both guilds) ----------
 
 def tier_for(score):
     for limit, name in TIERS:
@@ -280,7 +341,27 @@ async def send_long(message, text):
             await message.channel.send(c)
 
 
-# ---------- leaderboard ----------
+# ---------- leaderboards (per guild) ----------
+
+def season_rows(data, season):
+    """[(display name, score, discord id)] for everyone with a score."""
+    rows = []
+    for uid, p in data.items():
+        score = p["scores"].get(str(season))
+        if score is not None:
+            name = NAME_OVERRIDES.get(int(uid), strip_tag(p["ign"]))
+            rows.append((name, score, int(uid)))
+    return rows
+
+
+def rank_lines(rows, n):
+    top = sorted(rows, key=lambda r: r[1], reverse=True)[:n]
+    lines = []
+    for i, (name, score, did) in enumerate(top, 1):
+        tag = " *(soo low)*" if did in TOO_LOW else ""
+        lines.append(f"{i}. {esc(name)} — {score:,}{tag}")
+    return lines
+
 
 def movers(pairs, up):
     # Top 5 percentage increases (up=True) or decreases (up=False) from
@@ -312,30 +393,23 @@ def mover_lines(rows, up):
     return lines
 
 
-def build_board(data, season):
+def build_board(g, data, season):
     prev_season = season - 1
-    rows = []   # (display name, score, discord id)
+    rows = season_rows(data, season)
+    if not rows:
+        return f"No {g.name} scores have been submitted for season {season}."
+
     pairs = []  # (display name, previous season score, this season score)
     for uid, p in data.items():
         cur = p["scores"].get(str(season))
-        if cur is None:
-            continue
-        name = NAME_OVERRIDES.get(int(uid), strip_tag(p["ign"]))
-        rows.append((name, cur, int(uid)))
         old = p["scores"].get(str(prev_season))
-        if old is not None:
+        if cur is not None and old is not None:
+            name = NAME_OVERRIDES.get(int(uid), strip_tag(p["ign"]))
             pairs.append((name, old, cur))
 
-    if not rows:
-        return f"No scores have been submitted for season {season}."
-
-    top = sorted(rows, key=lambda r: r[1], reverse=True)[:10]
-    lines = []
-    for i, (n, score, did) in enumerate(top, 1):
-        tag = " *(soo low)*" if did in TOO_LOW else ""
-        lines.append(f"{i}. {esc(n)} — {score:,}{tag}")
-    text = f"**Top 10 – Guild Raid Season {season}**\n" + "\n".join(lines)
-
+    head = f"{g.tag} – " if g.tag else ""
+    text = (f"**{head}Top 10 – Guild Raid Season {season}**\n"
+            + "\n".join(rank_lines(rows, 10)))
     span = f"(S{prev_season} → S{season})"
     text += f"\n\n**weeks biggest W** {span}\n"
     text += "\n".join(mover_lines(movers(pairs, True), True))
@@ -344,69 +418,82 @@ def build_board(data, season):
     return text
 
 
-async def show_leaderboard(message):
-    data = load_data()
-    season = None
-    for w in message.content.split()[1:]:
-        m = re.fullmatch(r"s?(\d{1,3})", w, re.I)
-        if m:
-            season = int(m.group(1))
+async def show_leaderboard(message, g):
+    data = g.load()
+    season = season_from_args(message.content, data)
     if season is None:
-        season = current_season(data)
-    if season is None:
-        await message.reply("No scores have been submitted yet.")
+        await message.reply(f"No {g.name} scores have been submitted yet.")
         return
-    await send_long(message, build_board(data, season))
+    await send_long(message, build_board(g, data, season))
 
 
-# ---------- player commands ----------
+async def show_weeklylb(message, g):
+    data = g.load()
+    season = season_from_args(message.content, data)
+    if season is None:
+        await message.reply(f"No {g.name} scores have been submitted yet.")
+        return
+    rows = season_rows(data, season)
+    if not rows:
+        await message.reply(
+            f"No {g.name} scores have been submitted for season {season}.")
+        return
+    head = f"{g.tag} " if g.tag else ""
+    text = (f"**{head}Season {season} top 20**\n"
+            + "\n".join(rank_lines(rows, 20)))
+    await send_long(message, text)
+
+
+# ---------- player commands (search Cosmos first, then Astryx) ----------
 
 async def show_score(message):
     season, text = split_args(message.content)
-    data = load_data()
-    uid, p, err = find_player(data, message, text)
+    g, data, uid, p, err = lookup_any(message, text)
     if err:
         await message.reply(err)
         return
     if season is None:
         season = current_season(data)
     name = esc(strip_tag(p["ign"]))
-    score = p["scores"].get(str(season))
+    where = f" ({g.name})" if g is not COSMOS else ""
+    score = p["scores"].get(str(season)) if season is not None else None
     if score is None:
-        await message.reply(f"{name} has no score for season {season}.")
+        await message.reply(
+            f"{name}{where} has no score for season {season}.")
         return
-    await message.reply(f"**{name}** — season {season}: {score:,}")
+    await message.reply(f"**{name}**{where} — season {season}: {score:,}")
 
 
 async def show_average(message):
     _, text = split_args(message.content)
-    data = load_data()
-    uid, p, err = find_player(data, message, text)
+    g, data, uid, p, err = lookup_any(message, text)
     if err:
         await message.reply(err)
         return
     name = esc(strip_tag(p["ign"]))
+    where = f" ({g.name})" if g is not COSMOS else ""
     last = [v for _, v in sorted_scores(p)[-5:]]
     if not last:
-        await message.reply(f"{name} has no scores yet.")
+        await message.reply(f"{name}{where} has no scores yet.")
         return
     avg = round(sum(last) / len(last))
     s = "" if len(last) == 1 else "s"
     await message.reply(
-        f"**{name}**: average over the last {len(last)} season{s}: {avg:,}")
+        f"**{name}**{where}: average over the last {len(last)} "
+        f"season{s}: {avg:,}")
 
 
 async def show_compare(message):
     _, text = split_args(message.content)
-    data = load_data()
-    uid, p, err = find_player(data, message, text)
+    g, data, uid, p, err = lookup_any(message, text)
     if err:
         await message.reply(err)
         return
     name = esc(strip_tag(p["ign"]))
+    where = f" ({g.name})" if g is not COSMOS else ""
     items = sorted_scores(p)
     if not items:
-        await message.reply(f"{name} has no scores yet.")
+        await message.reply(f"{name}{where} has no scores yet.")
         return
     lines = []
     for n, i in enumerate(range(len(items) - 1,
@@ -418,13 +505,13 @@ async def show_compare(message):
             line += f" ({'+' if d >= 0 else '-'}{abs(d):,})"
         lines.append(line)
     await message.reply(
-        f"**{name} — last {len(lines)} seasons** (newest first)\n"
+        f"**{name}**{where} — last {len(lines)} seasons (newest first)\n"
         + "\n".join(lines))
 
 
-# ---------- management commands (owner only) ----------
+# ---------- management commands (owner only, per guild) ----------
 
-async def handle_list(message):
+async def handle_list(message, g):
     lines = message.content.strip().split("\n")
     head = lines[0].split()
     season = None
@@ -434,17 +521,20 @@ async def handle_list(message):
             season = int(m.group(1))
     if season is None:
         await message.reply(
-            "Usage: `!list sNN` on the first line, then one `IGN score` "
-            "per line.")
+            f"Usage: `{g.prefix}list sNN` on the first line, then one "
+            "`IGN score` per line.")
         return
     entries = lines[1:]
     if len(head) > 2:  # an entry on the same line as the command
         entries.insert(0, " ".join(head[2:]))
 
-    data = load_data()
+    data = g.load()
     idx = name_index(data)
-    touched, unreadable, unknown = set(), [], []
-    changed = 0
+    idx_all = name_index(data, True)
+    season_before = current_season(data)
+
+    touched = {}  # discord id -> score (the last line for a player wins)
+    unreadable, unknown, left, repeated, odd = [], [], [], [], []
     for raw in entries:
         if not raw.strip():
             continue
@@ -456,61 +546,95 @@ async def handle_list(message):
         key = match_key(ign)
         uid = idx.get(key)
         if uid is None:
-            close = difflib.get_close_matches(key, list(idx), n=1, cutoff=0.75)
-            hint = ""
-            if close:
-                hint = f" (did you mean {strip_tag(data[idx[close[0]]]['ign'])}?)"
-            unknown.append(f"{ign[:40]}{hint}")
+            if key in idx_all:
+                left.append(ign[:40])
+            else:
+                close = difflib.get_close_matches(
+                    key, list(idx), n=1, cutoff=0.75)
+                hint = ""
+                if close:
+                    shown = strip_tag(data[idx[close[0]]]["ign"])
+                    hint = f" (did you mean {shown}?)"
+                unknown.append(f"{ign[:40]}{hint}")
             continue
+        if uid in touched:
+            repeated.append(
+                f"{strip_tag(data[uid]['ign'])}: listed twice, "
+                f"using {score:,}")
+        touched[uid] = score
+
+    # Save the scores, and flag unusual ones
+    changed = 0
+    for uid, score in touched.items():
         p = data[uid]
         if p["scores"].get(str(season)) != score:
             changed += 1
         p["scores"][str(season)] = score
-        touched.add(uid)
-
+        prev = p["scores"].get(str(season - 1))
+        if prev and prev > 0:
+            ratio = score / prev
+            if ratio > JUMP_UP or ratio < JUMP_DOWN:
+                odd.append(
+                    f"{strip_tag(p['ign'])}: {score:,} vs {prev:,} in "
+                    f"S{season - 1} ({(ratio - 1) * 100:+.0f}%)")
     if touched:
-        save_data(data)
+        g.save(data)
 
-    # Update tier roles
+    # Update tier roles (from each player's best score in either guild)
     roles = 0
     cache = {}
     for uid in touched:
         member = await get_member(message.guild, int(uid), cache)
-        best = best_score(data[uid])
+        best = best_overall(uid)
         if member and best is not None:
             status, _ = await update_role(member, best)
             if status == "added":
                 roles += 1
 
+    out = []
     if touched:
         s = "" if len(touched) == 1 else "s"
-        out = (f"Saved {len(touched)} score{s} for season {season} "
-               f"({changed} new or changed).")
-        out += f"\nCurrent season: {current_season(data)}."
+        out.append(f"Saved {len(touched)} {g.name} score{s} for season "
+                   f"{season} ({changed} new or changed).")
+        out.append(f"Current {g.name} season: {current_season(data)}.")
         if roles:
-            out += f"\nRoles updated: {roles}."
+            out.append(f"Roles updated: {roles}.")
     else:
-        out = "I didn't find any score lines I could save."
-    if unknown:
-        out += ("\n\nUnknown names (not saved). Typo? New member? Use "
-                "`!link <discord id> IGN`:\n"
-                + "\n".join(f"- {u}" for u in unknown[:15]))
-        if len(unknown) > 15:
-            out += f"\n…and {len(unknown) - 15} more"
-    if unreadable:
-        out += ("\n\nCouldn't read these lines:\n"
-                + "\n".join(f"- {b}" for b in unreadable[:10]))
-    await send_long(message, out)
+        out.append("I didn't find any score lines I could save.")
+    if season_before is not None and (season > season_before + 1
+                                      or season < season_before - 5):
+        out.append(f"I'm not sure about the season: {season} is far from "
+                   f"the current season ({season_before}). Double-check it.")
+
+    def section(title, items, limit=15):
+        if not items:
+            return
+        text = title + "\n" + "\n".join(f"- {i}" for i in items[:limit])
+        if len(items) > limit:
+            text += f"\n…and {len(items) - limit} more"
+        out.append("\n" + text)
+
+    section("**Not saved: I don't recognise these names.** Typo or new "
+            f"member? Use `{g.prefix}link <discord id> IGN` for new "
+            "members.", unknown)
+    section(f"**Not saved: these members were removed with "
+            f"{g.prefix}unlink.**", left)
+    section("**Saved, but please double-check these scores:**", odd)
+    section("**Listed more than once (I used the last score):**", repeated)
+    section("**Couldn't read these lines:**", unreadable, 10)
+
+    await send_long(message, "\n".join(out))
 
 
-async def delete_season(message):
+async def delete_season(message, g):
     season, text = split_args(message.content)
     if season is None or (not text and not message.mentions):
         await message.reply(
-            "Usage: `!delete sNN IGN`, e.g. `!delete s98 Blask`")
+            f"Usage: `{g.prefix}delete sNN IGN`, e.g. "
+            f"`{g.prefix}delete s98 Blask`")
         return
-    data = load_data()
-    uid, p, err = find_player(data, message, text)
+    data = g.load()
+    uid, p, err = find_player(g, data, message, text)
     if err:
         await message.reply(err)
         return
@@ -520,13 +644,13 @@ async def delete_season(message):
         return
 
     del p["scores"][str(season)]
-    save_data(data)
+    g.save(data)
 
     reply = f"Deleted season {season} for {name}."
     member = await get_member(message.guild, int(uid), {})
     if member is not None:
-        # Lower the role to the best score still left
-        status, role_name = await force_role(member, best_score(p))
+        # Lower the role to the best score still left (in either guild)
+        status, role_name = await force_role(member, best_overall(uid))
         if status == "ok" and role_name:
             reply += f" Their role is now {role_name}."
         elif status == "ok":
@@ -538,17 +662,17 @@ async def delete_season(message):
     await message.reply(reply)
 
 
-async def link_player(message):
+async def link_player(message, g):
     words = message.content.split()[1:]
     m = (re.fullmatch(r"<@!?(\d{15,20})>|(\d{15,20})", words[0])
          if words else None)
     ign = " ".join(words[1:])
     if not m or not ign:
-        await message.reply("Usage: `!link <discord id> IGN`")
+        await message.reply(f"Usage: `{g.prefix}link <discord id> IGN`")
         return
     uid = m.group(1) or m.group(2)
 
-    data = load_data()
+    data = g.load()
     taken = name_index(data).get(match_key(ign))
     if taken and taken != uid:
         await message.reply(
@@ -557,52 +681,57 @@ async def link_player(message):
     p = data.setdefault(uid, {"ign": ign, "active": True, "scores": {}})
     p["ign"] = ign
     p["active"] = True
-    save_data(data)
+    g.save(data)
 
-    reply = f"Linked **{esc(strip_tag(ign))}** to Discord ID {uid}."
+    reply = f"Linked **{esc(strip_tag(ign))}** to Discord ID {uid} ({g.name})."
     member = await get_member(message.guild, int(uid), {})
     if member is None:
         reply += " (That user isn't in this server.)"
     else:
-        best = best_score(p)
+        best = best_overall(uid)
         if best is not None:
             status, role_name = await update_role(member, best)
             reply += role_note(status, role_name)
     await message.reply(reply)
 
 
-async def unlink_player(message):
+async def unlink_player(message, g):
     _, text = split_args(message.content)
-    data = load_data()
-    uid, p, err = find_player(data, message, text)
+    data = g.load()
+    uid, p, err = find_player(g, data, message, text)
     if err:
         await message.reply(err)
         return
     p["active"] = False
-    save_data(data)
+    g.save(data)
     await message.reply(
-        f"**{esc(strip_tag(p['ign']))}** is no longer in the roster. Their "
-        "old scores stay in past seasons. `!link <discord id> IGN` adds "
-        "them back.")
+        f"**{esc(strip_tag(p['ign']))}** is no longer in the {g.name} "
+        f"roster. Their old scores stay in past seasons. "
+        f"`{g.prefix}link <discord id> IGN` adds them back.")
 
 
 def commands_text(is_owner):
     lines = [
         "**Commands**",
-        "`!leaderboard [sNN]` — top 10 for a season (default: current), "
-        "plus weeks biggest W and weeks biggest fumble (% change vs the "
-        "season before), e.g. `!leaderboard s97`",
+        "`!leaderboard [sNN]` — Cosmos top 10 for a season (default: "
+        "current), plus weeks biggest W and weeks biggest fumble (% change "
+        "vs the season before), e.g. `!leaderboard s97`",
+        "`!weeklylb [sNN]` — Cosmos top 20 for a season (default: current)",
+        "`!astleaderboard [sNN]` — the same top 10 and W/fumble for Astryx",
+        "`!astweeklylb [sNN]` — Astryx top 20",
         "`!score <player> [sNN]` — a player's score in a season "
         "(default: current), e.g. `!score Blask s98`",
         "`!average <player>` — average of a player's last 5 seasons",
         "`!compare <player>` — a player's last 5 season scores",
         "`!commands` — show this list",
-        "<player> can be an IGN or an @mention.",
+        "<player> can be an IGN or an @mention (Cosmos is searched first, "
+        "then Astryx).",
     ]
     if is_owner:
         lines += [
             "",
-            "**Owner only**",
+            "**Owner only** (for Astryx use the same command with `ast` "
+            "after the `!`, e.g. `!astlist`)",
             "`!list sNN` + one `IGN score` per line — save or update the "
             "scores for a season",
             "`!delete sNN <player>` — delete a player's score for a season "
@@ -612,6 +741,24 @@ def commands_text(is_owner):
             "`!resetscores confirm` — delete all saved scores",
         ]
     return "\n".join(lines)
+
+
+# ---------- commands per guild ----------
+# name -> (handler, owner only?). Cosmos uses "!list", Astryx "!astlist".
+
+GUILD_COMMANDS = {
+    "leaderboard": (show_leaderboard, False),
+    "weeklylb": (show_weeklylb, False),
+    "list": (handle_list, True),
+    "delete": (delete_season, True),
+    "link": (link_player, True),
+    "unlink": (unlink_player, True),
+}
+
+ROUTES = {}
+for _g in GUILDS:
+    for _name, (_fn, _owner_only) in GUILD_COMMANDS.items():
+        ROUTES[_g.prefix + _name] = (_fn, _g, _owner_only)
 
 
 # ---------- events ----------
@@ -631,10 +778,7 @@ async def on_message(message):
     word = parts[0] if parts else ""
     is_owner = message.author.id in OWNER_IDS
 
-    # Public commands
-    if word == "!leaderboard":
-        await show_leaderboard(message)
-        return
+    # Commands that work for both guilds
     if word == "!score":
         await show_score(message)
         return
@@ -648,29 +792,30 @@ async def on_message(message):
         await message.reply(commands_text(is_owner))
         return
 
-    # Owner-only commands
-    owner_commands = {
-        "!list": handle_list,
-        "!delete": delete_season,
-        "!link": link_player,
-        "!unlink": unlink_player,
-    }
-    if word in owner_commands:
-        if is_owner:
-            await owner_commands[word](message)
-        else:
+    # Per-guild commands
+    route = ROUTES.get(word)
+    if route:
+        fn, g, owner_only = route
+        if owner_only and not is_owner:
             await message.reply("Only the bot owner can use that command.")
+            return
+        await fn(message, g)
         return
-    if cmd == "!resetscores confirm":
-        if is_owner:
-            data = load_data()
+
+    # Reset: !resetscores confirm / !astresetscores confirm
+    for g in GUILDS:
+        if cmd == g.prefix + "resetscores confirm":
+            if not is_owner:
+                await message.reply(
+                    "Only the bot owner can use that command.")
+                return
+            data = g.load()
             for p in data.values():
                 p["scores"] = {}
-            save_data(data)
-            await message.reply("All saved scores have been deleted.")
-        else:
-            await message.reply("Only the bot owner can use that command.")
-        return
+            g.save(data)
+            await message.reply(
+                f"All saved {g.name} scores have been deleted.")
+            return
 
 
 client.run(TOKEN)
